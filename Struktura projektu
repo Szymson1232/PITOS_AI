@@ -1,0 +1,15 @@
+PITOS_AI/
+├── main.py
+├── config.py
+├── requirements.txt
+├── Procfile
+├── .gitignore
+├── core/
+│   └── scanner.py
+├── data/
+│   └── odds_api.py
+├── database/
+│   ├── connection.py
+│   └── models.py
+└── telegram_bot/
+    └── commands.py
