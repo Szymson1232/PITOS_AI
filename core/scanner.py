@@ -20,12 +20,20 @@ SUPPORTED_GROUPS = {
 }
 
 MIN_BOOKMAKERS = 5
-MIN_ODDS = 1.20
 MAX_ODDS = 4.50
 
 BANKROLL = 400.0
 UNIT_VALUE = 25.0
-TEST_STAKE_UNITS = 1
+MAX_PUBLICATIONS = 10
+
+# Ostrożne progi startowe. To nadal estymacje rynkowe,
+# a nie zweryfikowany model predykcyjny.
+AKO_MIN_PROBABILITY = 0.65
+AKO_MIN_EV = 0.00
+AKO_MIN_COMBINED_PROBABILITY = 0.42
+
+SINGLE_MIN_PROBABILITY = 0.35
+SINGLE_MIN_EV = 0.05
 
 
 def calculate_market(event):
@@ -43,10 +51,12 @@ def calculate_market(event):
                 continue
 
             prices = {}
+
             for item in outcomes:
                 try:
-                    price = float(item.get("price", 0))
                     name = item.get("name")
+                    price = float(item.get("price", 0))
+
                     if name and price > 1:
                         prices[name] = price
                 except (TypeError, ValueError):
@@ -56,67 +66,55 @@ def calculate_market(event):
                 continue
 
             overround = sum(1 / price for price in prices.values())
+
             if overround <= 0:
                 continue
 
             for name, price in prices.items():
                 markets.setdefault(name, []).append({
+                    "bookmaker": bookmaker_name,
                     "probability": (1 / price) / overround,
                     "odds": price,
-                    "bookmaker": bookmaker_name,
                 })
 
     candidates = []
 
     for outcome, quotes in markets.items():
-        # Jedna obserwacja na bukmachera.
         unique_quotes = {}
+
         for quote in quotes:
-            key = quote["bookmaker"]
-            if key not in unique_quotes:
-                unique_quotes[key] = quote
+            bookmaker = quote["bookmaker"]
+
+            if bookmaker and bookmaker not in unique_quotes:
+                unique_quotes[bookmaker] = quote
 
         quotes = list(unique_quotes.values())
 
         if len(quotes) < MIN_BOOKMAKERS:
             continue
 
-        probabilities = [q["probability"] for q in quotes]
-        fair_probability = statistics.median(probabilities)
-        best_odds = max(q["odds"] for q in quotes)
+        probability = statistics.median(
+            quote["probability"] for quote in quotes
+        )
 
-        if not MIN_ODDS <= best_odds <= MAX_ODDS:
+        best_odds = max(
+            quote["odds"] for quote in quotes
+        )
+
+        if not 1.20 <= best_odds <= MAX_ODDS:
             continue
 
-        ev = fair_probability * best_odds - 1
+        ev = probability * best_odds - 1
 
         candidates.append({
             "outcome": outcome,
             "odds": best_odds,
-            "probability": fair_probability,
+            "probability": probability,
             "ev": ev,
             "bookmakers": len(quotes),
         })
 
     return candidates
-
-
-def classify_candidate(candidate):
-    probability = candidate["probability"]
-    ev = candidate["ev"]
-    odds = candidate["odds"]
-
-    # To są etykiety jakości kandydatów, nie gwarancje wyniku.
-    if probability >= 0.70 and 1.20 <= odds <= 1.80:
-        return "PEWNIACZKI"
-
-    if probability >= 0.50 and ev >= 0.04:
-        return "PEREŁKI"
-
-    if probability >= 0.35 and ev >= 0.03:
-        return "VALUE SINGLE"
-
-    return None
 
 
 async def already_published(record_key):
@@ -143,175 +141,167 @@ async def save_tip(
     details="",
 ):
     async with SessionLocal() as session:
-        existing = await session.execute(
+        result = await session.execute(
             select(TipRecord.id).where(
                 TipRecord.record_key == record_key
             )
         )
 
-        if existing.scalar_one_or_none() is not None:
+        if result.scalar_one_or_none() is not None:
             return False
 
-        tip = TipRecord(
-            record_key=record_key,
-            category=category,
-            event_id=event_id,
-            sport=sport,
-            home_team=home,
-            away_team=away,
-            selection=selection,
-            odds=odds,
-            probability=probability,
-            ev=ev,
-            stake_units=TEST_STAKE_UNITS,
-            stake_amount=UNIT_VALUE * TEST_STAKE_UNITS,
-            details=details,
+        session.add(
+            TipRecord(
+                record_key=record_key,
+                category=category,
+                event_id=event_id,
+                sport=sport,
+                home_team=home,
+                away_team=away,
+                selection=selection,
+                odds=odds,
+                probability=probability,
+                ev=ev,
+                stake_units=1,
+                stake_amount=UNIT_VALUE,
+                details=details,
+            )
         )
 
-        session.add(tip)
         await session.commit()
         return True
 
 
-def format_candidate(category, sport, event, candidate):
-    home = event.get("home_team", "Nieznana drużyna")
-    away = event.get("away_team", "Nieznana drużyna")
-
+def value_single_ok(candidate):
     return (
-        f"🏆 PITOS AI | {category}\n\n"
-        f"🏅 Dyscyplina: {sport}\n"
-        f"⚔️ Mecz: {home} – {away}\n"
-        f"🎯 Typ: {candidate['outcome']}\n\n"
-        f"📈 Kurs: {candidate['odds']:.2f}\n"
-        f"📊 Prawdopodobieństwo rynkowe: "
-        f"{candidate['probability'] * 100:.1f}%\n"
-        f"💹 Szacowane EV: {candidate['ev'] * 100:.2f}%\n"
-        f"🏦 Bukmacherzy: {candidate['bookmakers']}\n\n"
-        f"💰 Stawka testowa: 1j = {UNIT_VALUE:.0f} zł\n"
-        f"🏦 Budżet testowy: {BANKROLL:.0f} zł\n\n"
-        "⚠️ Analiza oparta na kursach rynkowych. "
-        "Nie jest to niezależna prognoza ani gwarancja wygranej."
+        candidate["probability"] >= SINGLE_MIN_PROBABILITY
+        and candidate["ev"] >= SINGLE_MIN_EV
+        and 1.50 <= candidate["odds"] <= MAX_ODDS
     )
 
 
-async def publish_candidate(bot, chat_id, sport, event, candidate):
-    category = classify_candidate(candidate)
-    if not category:
-        return False
+def ako_leg_ok(candidate):
+    return (
+        candidate["probability"] >= AKO_MIN_PROBABILITY
+        and candidate["ev"] >= AKO_MIN_EV
+        and candidate["odds"] >= 1.20
+        and candidate["bookmakers"] >= MIN_BOOKMAKERS
+    )
 
-    event_id = event.get("id", "")
-    outcome = candidate["outcome"]
-    record_key = f"{event_id}:{outcome}:{category}"
+
+async def publish_single(bot, chat_id, item):
+    event = item["event"]
+    candidate = item["candidate"]
+
+    event_id = item["event_id"]
+    selection = candidate["outcome"]
+
+    record_key = f"VALUE_SINGLE:{event_id}:{selection}"
 
     if await already_published(record_key):
         return False
 
-    home = event.get("home_team", "")
-    away = event.get("away_team", "")
+    message = (
+        "📈 PITOS AI | VALUE SINGLE\n\n"
+        f"🏆 Dyscyplina: {item['sport']}\n"
+        f"⚔️ Mecz: {event['home_team']} – {event['away_team']}\n"
+        f"🎯 Typ: {selection}\n\n"
+        f"📊 Kurs: {candidate['odds']:.2f}\n"
+        f"📉 Prawdopodobieństwo rynkowe: "
+        f"{candidate['probability'] * 100:.1f}%\n"
+        f"💹 Orientacyjne EV: {candidate['ev'] * 100:.2f}%\n"
+        f"🏦 Źródła: {candidate['bookmakers']}\n\n"
+        f"💰 Stawka testowa: 1j = {UNIT_VALUE:.0f} zł\n"
+        f"🏦 Budżet testowy: {BANKROLL:.0f} zł\n\n"
+        "⚠️ VALUE SINGLE oznacza wyższe ryzyko. "
+        "EV wyliczono z kursów rynkowych i nie jest potwierdzoną przewagą."
+    )
 
-    message = format_candidate(category, sport, event, candidate)
+    await bot.send_message(chat_id=chat_id, text=message)
 
-    saved = await save_tip(
+    return await save_tip(
         record_key=record_key,
-        category=category,
+        category="VALUE SINGLE",
         event_id=event_id,
-        sport=sport,
-        home=home,
-        away=away,
-        selection=outcome,
+        sport=item["sport"],
+        home=event["home_team"],
+        away=event["away_team"],
+        selection=selection,
         odds=candidate["odds"],
         probability=candidate["probability"],
         ev=candidate["ev"],
-        details="Market consensus estimate; not independently validated.",
+        details="Market-derived estimate; not independently validated.",
     )
 
-    if not saved:
+
+async def publish_ako2(bot, chat_id, first, second):
+    a = first["candidate"]
+    b = second["candidate"]
+
+    combined_odds = a["odds"] * b["odds"]
+    combined_probability = a["probability"] * b["probability"]
+
+    if combined_odds < 1.44:
         return False
 
-    await bot.send_message(chat_id=chat_id, text=message)
-    return True
+    if combined_probability < AKO_MIN_COMBINED_PROBABILITY:
+        return False
 
+    # Stabilny klucz, niezależny od kolejności pary.
+    legs = sorted([
+        (first["event_id"], a["outcome"]),
+        (second["event_id"], b["outcome"]),
+    ])
 
-async def build_ako2(bot, chat_id, candidates):
-    # AKO2 składamy tylko z dwóch różnych wydarzeń.
-    eligible = [
-        item for item in candidates
-        if item["candidate"]["odds"] >= 1.20
-        and item["candidate"]["probability"] >= 0.58
-    ]
-
-    eligible.sort(
-        key=lambda x: x["candidate"]["probability"],
-        reverse=True,
+    record_key = (
+        f"AKO2:{legs[0][0]}:{legs[0][1]}:"
+        f"{legs[1][0]}:{legs[1][1]}"
     )
 
-    for first, second in combinations(eligible, 2):
-        if first["event_id"] == second["event_id"]:
-            continue
+    if await already_published(record_key):
+        return False
 
-        odds_a = first["candidate"]["odds"]
-        odds_b = second["candidate"]["odds"]
-        combined_odds = odds_a * odds_b
+    message = (
+        "🎟️ PITOS AI | QUALITY AKO2\n\n"
+        "1️⃣ "
+        f"{first['event']['home_team']} – "
+        f"{first['event']['away_team']}\n"
+        f"Typ: {a['outcome']}\n"
+        f"Kurs: {a['odds']:.2f}\n\n"
+        "2️⃣ "
+        f"{second['event']['home_team']} – "
+        f"{second['event']['away_team']}\n"
+        f"Typ: {b['outcome']}\n"
+        f"Kurs: {b['odds']:.2f}\n\n"
+        f"📈 Kurs łączny: {combined_odds:.2f}\n"
+        f"📊 Orientacyjne prawdopodobieństwo: "
+        f"{combined_probability * 100:.1f}%\n\n"
+        f"💰 Stawka testowa: 1j = {UNIT_VALUE:.0f} zł\n"
+        f"🏦 Budżet testowy: {BANKROLL:.0f} zł\n\n"
+        "⚠️ Wyliczenie łącznego prawdopodobieństwa zakłada "
+        "niezależność zdarzeń. Korelacja nie jest jeszcze modelowana. "
+        "Sprawdź warunki promocji u bukmachera."
+    )
 
-        if combined_odds < 1.44:
-            continue
+    await bot.send_message(chat_id=chat_id, text=message)
 
-        probability = (
-            first["candidate"]["probability"]
-            * second["candidate"]["probability"]
-        )
-
-        record_key = (
-            f"AKO2:{first['event_id']}:{first['candidate']['outcome']}:"
-            f"{second['event_id']}:{second['candidate']['outcome']}"
-        )
-
-        if await already_published(record_key):
-            continue
-
-        text = (
-            "🎟️ PITOS AI | AKO2\n\n"
-            f"1️⃣ {first['home']} – {first['away']}\n"
-            f"Typ: {first['candidate']['outcome']}\n"
-            f"Kurs: {odds_a:.2f}\n\n"
-            f"2️⃣ {second['home']} – {second['away']}\n"
-            f"Typ: {second['candidate']['outcome']}\n"
-            f"Kurs: {odds_b:.2f}\n\n"
-            f"📈 Kurs łączny: {combined_odds:.2f}\n"
-            f"📊 Orientacyjne prawdopodobieństwo: "
-            f"{probability * 100:.1f}%\n"
-            f"💰 Stawka testowa: 1j = {UNIT_VALUE:.0f} zł\n\n"
-            "⚠️ Prawdopodobieństwo łączone zakłada niezależność zdarzeń. "
-            "To założenie może być niedokładne. Sprawdź warunki promocji "
-            "i dostępność rynków u bukmachera."
-        )
-
-        saved = await save_tip(
-            record_key=record_key,
-            category="AKO2",
-            event_id=f"{first['event_id']}+{second['event_id']}",
-            sport="Mixed",
-            home=first["home"],
-            away=second["away"],
-            selection=(
-                f"{first['candidate']['outcome']} + "
-                f"{second['candidate']['outcome']}"
-            ),
-            odds=combined_odds,
-            probability=probability,
-            ev=0.0,
-            details="Two-leg accumulator; independence not verified.",
-        )
-
-        if saved:
-            await bot.send_message(chat_id=chat_id, text=text)
-            return True
-
-    return False
+    return await save_tip(
+        record_key=record_key,
+        category="AKO2",
+        event_id=f"{first['event_id']}+{second['event_id']}",
+        sport="Mixed",
+        home=first["event"]["home_team"],
+        away=second["event"]["away_team"],
+        selection=f"{a['outcome']} + {b['outcome']}",
+        odds=combined_odds,
+        probability=combined_probability,
+        ev=0.0,
+        details="Two-leg accumulator; independence not verified.",
+    )
 
 
 async def scan_sports(api, bot, chat_id):
-    logger.info("PITOS AI V2 | QUALITY FIRST SCAN STARTED")
+    logger.info("PITOS QUALITY FIRST SCAN STARTED")
 
     sports = await api.get_sports()
 
@@ -321,10 +311,9 @@ async def scan_sports(api, bot, chat_id):
         and sport.get("group") in SUPPORTED_GROUPS
     ]
 
-    logger.info("Supported active sport keys: %s", len(selected))
+    logger.info("Supported sport keys: %s", len(selected))
 
-    published = 0
-    ako_candidates = []
+    all_items = []
     event_count = 0
 
     for sport in selected:
@@ -336,35 +325,28 @@ async def scan_sports(api, bot, chat_id):
             event_count += len(events)
 
             for event in events:
+                event_id = event.get("id")
+
+                if not event_id:
+                    continue
+
                 commence = event.get("commence_time")
 
                 if commence:
                     event_time = datetime.fromisoformat(
                         commence.replace("Z", "+00:00")
                     )
+
                     if event_time <= datetime.now(timezone.utc):
                         continue
 
-                candidates = calculate_market(event)
-
-                for candidate in candidates:
-                    category = classify_candidate(candidate)
-                    if not category:
-                        continue
-
-                    item = {
-                        "event_id": event.get("id", ""),
-                        "home": event.get("home_team", ""),
-                        "away": event.get("away_team", ""),
+                for candidate in calculate_market(event):
+                    all_items.append({
+                        "event_id": event_id,
+                        "event": event,
+                        "sport": sport_name,
                         "candidate": candidate,
-                    }
-
-                    ako_candidates.append(item)
-
-                    if await publish_candidate(
-                        bot, chat_id, sport_name, event, candidate
-                    ):
-                        published += 1
+                    })
 
             logger.info(
                 "Scanned %s | events: %s",
@@ -375,19 +357,101 @@ async def scan_sports(api, bot, chat_id):
         except Exception:
             logger.exception("Scanner error: %s", sport_key)
 
-    try:
-        if await build_ako2(bot, chat_id, ako_candidates):
-            published += 1
-    except Exception:
-        logger.exception("AKO2 builder error")
+    # Najpierw budujemy pulę jakościowych nóg AKO2.
+    ako_pool = [
+        item for item in all_items
+        if ako_leg_ok(item["candidate"])
+    ]
 
-    logger.info(
-        "QUALITY SCAN FINISHED | Events: %s | Published: %s",
-        event_count,
-        published,
+    # Sortowanie po prawdopodobieństwie, potem EV.
+    ako_pool.sort(
+        key=lambda item: (
+            item["candidate"]["probability"],
+            item["candidate"]["ev"],
+        ),
+        reverse=True,
     )
 
-    if published == 0:
-        logger.info("QUALITY FIRST: no selections passed the filters.")
+    publications = 0
+    used_events = set()
 
-    return published
+    # Publikujemy najwyżej 10 kuponów łącznie.
+    for first, second in combinations(ako_pool, 2):
+        if publications >= MAX_PUBLICATIONS:
+            break
+
+        if first["event_id"] == second["event_id"]:
+            continue
+
+        if first["event_id"] in used_events:
+            continue
+
+        if second["event_id"] in used_events:
+            continue
+
+        combined_probability = (
+            first["candidate"]["probability"]
+            * second["candidate"]["probability"]
+        )
+
+        combined_odds = (
+            first["candidate"]["odds"]
+            * second["candidate"]["odds"]
+        )
+
+        if combined_probability < AKO_MIN_COMBINED_PROBABILITY:
+            continue
+
+        if combined_odds < 1.44:
+            continue
+
+        try:
+            published = await publish_ako2(
+                bot, chat_id, first, second
+            )
+
+            if published:
+                publications += 1
+                used_events.add(first["event_id"])
+                used_events.add(second["event_id"])
+
+        except Exception:
+            logger.exception("AKO2 publication failed")
+
+    # Dopiero potem ewentualne VALUE SINGLE.
+    singles = [
+        item for item in all_items
+        if value_single_ok(item["candidate"])
+        and item["event_id"] not in used_events
+    ]
+
+    singles.sort(
+        key=lambda item: (
+            item["candidate"]["ev"],
+            item["candidate"]["probability"],
+        ),
+        reverse=True,
+    )
+
+    for item in singles:
+        if publications >= MAX_PUBLICATIONS:
+            break
+
+        try:
+            published = await publish_single(bot, chat_id, item)
+
+            if published:
+                publications += 1
+                used_events.add(item["event_id"])
+
+        except Exception:
+            logger.exception("VALUE SINGLE publication failed")
+
+    logger.info(
+        "QUALITY SCAN FINISHED | Events: %s | Publications: %s/%s",
+        event_count,
+        publications,
+        MAX_PUBLICATIONS,
+    )
+
+    return publications
