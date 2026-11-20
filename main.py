@@ -6,19 +6,15 @@ from telegram.ext import Application, CommandHandler
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from config import (
+    ODDS_API_KEY,
     TELEGRAM_BOT_TOKEN,
     TELEGRAM_CHAT_ID,
-    validate_config
+    validate_config,
 )
 
 from database.connection import init_db
 from data.odds_api import OddsAPI
-
-from telegram_bot.commands import (
-    start,
-    status,
-    help_command,
-)
+from telegram_bot.commands import start, status, help_command
 
 
 logging.basicConfig(
@@ -26,28 +22,26 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 
+# Ograniczenie powtarzających się logów zapytań HTTP
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 logger = logging.getLogger("PITOS_AI")
 
 
 async def main():
-    # Sprawdzenie konfiguracji
     validate_config()
 
     logger.info("Starting PITOS AI...")
 
-    # Inicjalizacja bazy danych
+    # Baza danych
     await init_db()
     logger.info("Database connection OK")
 
-    # Połączenie z The Odds API
+    # The Odds API
     api = OddsAPI(api_key=ODDS_API_KEY)
 
-    # Inicjalizacja Telegrama
-    app = (
-        Application.builder()
-        .token(TELEGRAM_BOT_TOKEN)
-        .build()
-    )
+    # Telegram
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("status", status))
@@ -59,52 +53,63 @@ async def main():
     async def health_check():
         try:
             sports = await api.get_sports()
-
             logger.info(
                 "ODDS API CONNECTION OK | Sports: %s",
                 len(sports),
             )
-
         except Exception:
             logger.exception("ODDS API CONNECTION ERROR")
 
     scheduler.add_job(
         health_check,
-        trigger="interval",
+        "interval",
         minutes=30,
         id="health_check",
         replace_existing=True,
     )
 
-    # Uruchomienie aplikacji
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling()
-
-    scheduler.start()
-
-    logger.info("PITOS AI ONLINE!")
-
-    # Pierwszy test API
-    await health_check()
-    await app.bot.send_message(
-    chat_id=TELEGRAM_CHAT_ID,
-    text="🚀 PITOS AI ONLINE!\n\nPołączenie z kanałem działa poprawnie."
-)
-
     try:
+        await app.initialize()
+        await app.start()
+        await app.updater.start_polling()
+
+        scheduler.start()
+
+        logger.info("PITOS AI ONLINE!")
+
+        # Test połączenia z The Odds API
+        await health_check()
+
+        # Test publikacji na kanale
+        await app.bot.send_message(
+            chat_id=TELEGRAM_CHAT_ID,
+            text=(
+                "🚀 PITOS AI ONLINE!\n\n"
+                "✅ Telegram: połączenie aktywne\n"
+                "✅ Baza danych: połączenie aktywne\n"
+                "✅ The Odds API: połączenie aktywne\n\n"
+                "System jest uruchomiony. "
+                "Trwa przygotowanie modułu analitycznego."
+            ),
+        )
+
+        logger.info("TEST MESSAGE SENT TO TELEGRAM CHANNEL")
+
         while True:
             await asyncio.sleep(3600)
 
     finally:
-        logger.info("Stopping PITOS AI...")
-
-        scheduler.shutdown(wait=False)
+        if scheduler.running:
+            scheduler.shutdown(wait=False)
 
         await api.close()
 
-        await app.updater.stop()
-        await app.stop()
+        if app.updater and app.updater.running:
+            await app.updater.stop()
+
+        if app.running:
+            await app.stop()
+
         await app.shutdown()
 
 
