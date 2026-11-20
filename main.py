@@ -7,8 +7,8 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from config import (
     TELEGRAM_BOT_TOKEN,
-    ODDS_API_KEY,
-    validate_config,
+    TELEGRAM_CHAT_ID,
+    validate_config
 )
 
 from database.connection import init_db
