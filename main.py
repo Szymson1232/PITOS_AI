@@ -45,8 +45,7 @@ async def main():
         # ODDS API
         api = OddsAPI(api_key=ODDS_API_KEY)
 
-        # TELEGRAM — tylko wysyłanie wiadomości.
-        # Polling wyłączony, więc nie ma konfliktu getUpdates.
+        # TELEGRAM — outbound messages only
         app = (
             Application.builder()
             .token(TELEGRAM_BOT_TOKEN)
@@ -69,7 +68,10 @@ async def main():
                 logger.exception("ODDS API HEALTH CHECK FAILED")
 
         async def quality_scan(session_name):
-            logger.info("STARTING %s QUALITY SESSION", session_name)
+            logger.info(
+                "STARTING %s QUALITY SESSION",
+                session_name,
+            )
 
             try:
                 published = await scan_sports(
@@ -90,7 +92,7 @@ async def main():
                     session_name,
                 )
 
-        # Codzienna sesja 06:00
+        # DAILY SESSION — 06:00
         scheduler.add_job(
             quality_scan,
             "cron",
@@ -103,7 +105,7 @@ async def main():
             coalesce=True,
         )
 
-        # Nocna sesja 22:00
+        # NIGHT SESSION — 22:00
         scheduler.add_job(
             quality_scan,
             "cron",
@@ -116,7 +118,7 @@ async def main():
             coalesce=True,
         )
 
-        # Kontrola API co 30 minut
+        # API HEALTH CHECK — EVERY 30 MINUTES
         scheduler.add_job(
             health_check,
             "interval",
@@ -133,6 +135,7 @@ async def main():
             "PITOS AI ONLINE | 06:00 / 22:00 | POLLING DISABLED"
         )
 
+        # STARTUP MESSAGE
         await app.bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
             text=(
@@ -149,7 +152,14 @@ async def main():
             ),
         )
 
-        # Bez natychmiastowego skanowania po restarcie.
+        # DAY 0 — ONE-TIME STARTUP TEST
+        logger.info("DAY 0 TEST STARTING")
+
+        await quality_scan("DZIEN 0 | TEST STARTOWY")
+
+        logger.info("DAY 0 TEST FINISHED")
+
+        # NORMAL OPERATION
         while True:
             await asyncio.sleep(3600)
 
