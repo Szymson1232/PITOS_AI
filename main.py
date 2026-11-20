@@ -87,6 +87,10 @@ async def main():
 
     # Pierwszy test API
     await health_check()
+    await app.bot.send_message(
+    chat_id=TELEGRAM_CHAT_ID,
+    text="🚀 PITOS AI ONLINE!\n\nPołączenie z kanałem działa poprawnie."
+)
 
     try:
         while True:
