@@ -14,11 +14,7 @@ from config import (
 
 from database.connection import init_db
 from data.odds_api import OddsAPI
-from telegram_bot.commands import (
-    start,
-    status,
-    help_command,
-)
+from telegram_bot.commands import start, status, help_command
 from core.scanner import scan_sports
 
 
@@ -30,25 +26,24 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger("PITOS_AI")
 
+POLAND_TIMEZONE = "Europe/Warsaw"
+
 
 async def main():
     validate_config()
 
-    logger.info("STARTING PITOS AI V2 | QUALITY FIRST")
-
     api = None
     app = None
-    scheduler = AsyncIOScheduler(timezone="UTC")
+    scheduler = AsyncIOScheduler(timezone=POLAND_TIMEZONE)
 
     try:
-        # DATABASE
+        logger.info("STARTING PITOS AI | QUALITY FIRST")
+
         await init_db()
         logger.info("POSTGRESQL CONNECTION OK")
 
-        # ODDS API
         api = OddsAPI(api_key=ODDS_API_KEY)
 
-        # TELEGRAM
         app = (
             Application.builder()
             .token(TELEGRAM_BOT_TOKEN)
@@ -59,49 +54,60 @@ async def main():
         app.add_handler(CommandHandler("status", status))
         app.add_handler(CommandHandler("help", help_command))
 
-        async def health_check():
+        async def quality_scan(session_name):
+            logger.info("STARTING %s SESSION", session_name)
+
             try:
-                sports = await api.get_sports()
-                logger.info(
-                    "ODDS API OK | Available sport keys: %s",
-                    len(sports),
+                await app.bot.send_message(
+                    chat_id=TELEGRAM_CHAT_ID,
+                    text=f"🔎 PITOS AI | Rozpoczynam sesję {session_name}.",
                 )
-            except Exception:
-                logger.exception("ODDS API HEALTH CHECK FAILED")
 
-        async def quality_scan():
-            try:
-                logger.info("STARTING PITOS AI QUALITY SCAN")
-
-                count = await scan_sports(
+                published = await scan_sports(
                     api=api,
                     bot=app.bot,
                     chat_id=TELEGRAM_CHAT_ID,
                 )
 
                 logger.info(
-                    "QUALITY SCAN COMPLETE | Published: %s",
-                    count,
+                    "%s SESSION FINISHED | Published: %s",
+                    session_name,
+                    published,
+                )
+
+                await app.bot.send_message(
+                    chat_id=TELEGRAM_CHAT_ID,
+                    text=(
+                        f"✅ PITOS AI | Koniec sesji {session_name}\n"
+                        f"Opublikowane propozycje: {published}/10\n\n"
+                        "QUALITY FIRST: brak dobrych okazji oznacza brak typu."
+                    ),
                 )
 
             except Exception:
-                logger.exception("QUALITY SCAN FAILED")
+                logger.exception("%s SESSION FAILED", session_name)
 
+        # RAPORT DZIENNY — 06:00 czasu polskiego
         scheduler.add_job(
-            health_check,
-            "interval",
-            minutes=30,
-            id="health_check",
+            quality_scan,
+            "cron",
+            hour=6,
+            minute=0,
+            args=["DZIENNA"],
+            id="daily_quality_scan",
             replace_existing=True,
             max_instances=1,
             coalesce=True,
         )
 
+        # RAPORT NOCNY — 22:00 czasu polskiego
         scheduler.add_job(
             quality_scan,
-            "interval",
-            minutes=60,
-            id="quality_scan",
+            "cron",
+            hour=22,
+            minute=0,
+            args=["NOCNA"],
+            id="night_quality_scan",
             replace_existing=True,
             max_instances=1,
             coalesce=True,
@@ -115,30 +121,27 @@ async def main():
 
         scheduler.start()
 
-        logger.info("PITOS AI V2 ONLINE")
-
-        await health_check()
+        logger.info("PITOS AI ONLINE | SCHEDULE: 06:00 / 22:00")
 
         await app.bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
             text=(
-                "🚀 PITOS AI V2 ONLINE\n\n"
+                "🚀 PITOS AI | QUALITY FIRST ONLINE\n\n"
                 "✅ Telegram: ACTIVE\n"
                 "✅ PostgreSQL: ACTIVE\n"
-                "✅ The Odds API: ACTIVE\n"
-                "✅ QUALITY FIRST: ACTIVE\n\n"
-                "🏆 PEWNIACZKI\n"
-                "💎 PEREŁKI\n"
-                "📈 VALUE SINGLE\n"
-                "🎟️ AKO2 | min. 1.20 na zdarzenie\n\n"
+                "✅ The Odds API: ACTIVE\n\n"
+                "🎟️ AKO2\n"
+                "📈 VALUE SINGLE\n\n"
+                "🕕 Sesja dzienna: 06:00\n"
+                "🌙 Sesja nocna: 22:00\n"
+                "🔟 Maksymalnie 10 publikacji na sesję\n\n"
                 "💰 Budżet testowy: 400 zł\n"
-                "🪙 Jednostka: 25 zł\n\n"
-                "Pierwszy skan rozpoczyna się teraz."
+                "🪙 1j = 25 zł\n\n"
+                "Brak dobrych okazji = brak publikacji."
             ),
         )
 
-        await quality_scan()
-
+        # Nie uruchamiamy skanowania przy restarcie.
         while True:
             await asyncio.sleep(3600)
 
